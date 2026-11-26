@@ -162,9 +162,16 @@ def main() -> None:
         f"Total motif records: {len(clustered_sites):,}"
     )
 
+    unique_interval_count = (
+    clustered_sites[
+        ["chromosome", "start", "end"]
+    ]
+    .drop_duplicates()
+    .shape[0]
+)
+
     summary.append(
-        "Unique genomic intervals: "
-        f"{clustered_sites[['chromosome', 'start', 'end']].drop_duplicates().shape,}"
+        f"Unique genomic intervals: {unique_interval_count:,}"
     )
 
     summary.append(
