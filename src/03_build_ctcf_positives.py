@@ -2,122 +2,58 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pysam
 
 
 # ---------------------------------------------------------
-# Paths and project settings
+# Project settings
 # ---------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 RAW_DIR = PROJECT_ROOT / "datasets" / "raw"
 PROCESSED_DIR = PROJECT_ROOT / "datasets" / "processed"
+REFERENCE_DIR = PROJECT_ROOT / "datasets" / "reference" / "hg19"
 
 MOTIF_POS_PATH = RAW_DIR / "factorbookMotifPos.txt.gz"
-PWM_PATH = RAW_DIR / "factorbookMotifPwm.txt.gz"
+
 REGULATORY_PATH = (
-    RAW_DIR / "wgEncodeRegTfbsClusteredV3.GM12878.merged.bed.gz"
+    RAW_DIR
+    / "wgEncodeRegTfbsClusteredV3.GM12878.merged.bed.gz"
 )
 
-OUTPUT_PATH = PROCESSED_DIR / "tf_selection_table.tsv"
+REFERENCE_PATH = REFERENCE_DIR / "hg19.primary.fa"
+
+OUTPUT_PATH = PROCESSED_DIR / "ctcf_positive_sites.tsv.gz"
+SUMMARY_PATH = PROCESSED_DIR / "ctcf_positive_summary.txt"
+
+TF_NAME = "CTCF"
+MOTIF_LENGTH = 15
+FLANK_LENGTH = 10
+WINDOW_LENGTH = MOTIF_LENGTH + (2 * FLANK_LENGTH)
 
 PRIMARY_CHROMOSOMES = [f"chr{i}" for i in range(1, 23)]
 
 
 # ---------------------------------------------------------
-# PWM parsing
+# Sequence utilities
 # ---------------------------------------------------------
 
-def parse_probability_array(text: str) -> np.ndarray:
-    """
-    Parse a comma-separated array from the PWM file.
-
-    Each array has a trailing comma, so empty values are removed.
-    """
-
-    values = [
-        float(value)
-        for value in text.split(",")
-        if value.strip() != ""
-    ]
-
-    return np.asarray(values, dtype=float)
+COMPLEMENT_TABLE = str.maketrans(
+    {
+        "A": "T",
+        "C": "G",
+        "G": "C",
+        "T": "A",
+        "N": "N",
+    }
+)
 
 
-def load_pwms(path: Path) -> dict:
-    """
-    Load the Factorbook PWM file.
+def reverse_complement(sequence: str) -> str:
+    """Return the reverse complement of a DNA sequence."""
 
-    Expected columns:
-        TF, length, A values, C values, G values, T values
-    """
-
-    pwm_table = pd.read_csv(
-        path,
-        sep="\t",
-        header=None,
-        names=["tf", "length", "A", "C", "G", "T"],
-        compression="gzip",
-    )
-
-    print(f"PWM records read: {len(pwm_table):,}")
-
-    if pwm_table["tf"].duplicated().any():
-        duplicate_names = sorted(
-            pwm_table.loc[
-                pwm_table["tf"].duplicated(keep=False),
-                "tf",
-            ].unique()
-        )
-
-        raise ValueError(
-            "Duplicate TF names found in PWM file: "
-            + ", ".join(duplicate_names)
-        )
-
-    pwms = {}
-
-    for row in pwm_table.itertuples(index=False):
-        matrix = np.vstack(
-            [
-                parse_probability_array(row.A),
-                parse_probability_array(row.C),
-                parse_probability_array(row.G),
-                parse_probability_array(row.T),
-            ]
-        )
-
-        expected_length = int(row.length)
-
-        if matrix.shape != (4, expected_length):
-            raise ValueError(
-                f"Invalid PWM shape for {row.tf}: "
-                f"expected (4, {expected_length}), "
-                f"found {matrix.shape}"
-            )
-
-        column_sums = matrix.sum(axis=0)
-
-        if not np.allclose(
-            column_sums,
-            1.0,
-            atol=0.02,
-        ):
-            maximum_error = np.max(np.abs(column_sums - 1.0))
-
-            raise ValueError(
-                f"PWM probabilities do not sum to one for "
-                f"{row.tf}. Maximum error: {maximum_error:.6f}"
-            )
-
-        pwms[row.tf] = {
-            "length": expected_length,
-            "matrix": matrix,
-        }
-
-    print(f"Validated PWMs: {len(pwms):,}")
-
-    return pwms
+    return sequence.upper().translate(COMPLEMENT_TABLE)[::-1]
 
 
 # ---------------------------------------------------------
@@ -125,13 +61,15 @@ def load_pwms(path: Path) -> dict:
 # ---------------------------------------------------------
 
 def load_binding_sites() -> pd.DataFrame:
+    """Load the supplied Factorbook motif-position file."""
+
     column_names = [
         "record_id",
         "chromosome",
         "start",
         "end",
         "tf",
-        "score",
+        "supplied_score",
         "strand",
     ]
 
@@ -149,6 +87,8 @@ def load_binding_sites() -> pd.DataFrame:
 
 
 def load_regulatory_regions() -> pd.DataFrame:
+    """Load the GM12878 active regulatory regions."""
+
     regions = pd.read_csv(
         REGULATORY_PATH,
         sep="\t",
@@ -166,30 +106,22 @@ def load_regulatory_regions() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------
-# Interval overlap
+# Active-region overlap
 # ---------------------------------------------------------
 
-def mark_regulatory_overlaps(
+def annotate_active_regions(
     sites: pd.DataFrame,
     regions: pd.DataFrame,
-) -> pd.Series:
+) -> pd.DataFrame:
     """
-    Mark each site that overlaps at least one active regulatory region.
+    Annotate each site with the overlapping active regulatory region.
 
-    The regulatory intervals are already merged, according to the
-    supplied file name. For each chromosome, we use binary search
-    against the sorted regulatory-region starts.
-
-    BED overlap condition:
-        site_start < region_end
-        and site_end > region_start
+    The supplied regulatory-region file is merged, allowing a
+    binary-search approach within each chromosome.
     """
 
-    overlaps = pd.Series(
-        False,
-        index=sites.index,
-        dtype=bool,
-    )
+    sites = sites.copy()
+    sites["region_id"] = pd.NA
 
     for chromosome in PRIMARY_CHROMOSOMES:
         site_mask = sites["chromosome"].eq(chromosome)
@@ -203,7 +135,7 @@ def mark_regulatory_overlaps(
         chromosome_regions = (
             regions.loc[
                 region_mask,
-                ["start", "end"],
+                ["start", "end", "region_id"],
             ]
             .sort_values(["start", "end"])
             .reset_index(drop=True)
@@ -214,12 +146,11 @@ def mark_regulatory_overlaps(
 
         region_starts = chromosome_regions["start"].to_numpy()
         region_ends = chromosome_regions["end"].to_numpy()
+        region_ids = chromosome_regions["region_id"].to_numpy()
 
         site_starts = chromosome_sites["start"].to_numpy()
         site_ends = chromosome_sites["end"].to_numpy()
 
-        # Find the rightmost regulatory interval whose start is
-        # strictly smaller than the site end.
         candidate_indices = (
             np.searchsorted(
                 region_starts,
@@ -229,251 +160,407 @@ def mark_regulatory_overlaps(
             - 1
         )
 
-        valid_candidates = candidate_indices >= 0
+        valid = candidate_indices >= 0
 
-        chromosome_overlap = np.zeros(
+        overlaps = np.zeros(
             len(chromosome_sites),
             dtype=bool,
         )
 
-        chromosome_overlap[valid_candidates] = (
-            region_ends[candidate_indices[valid_candidates]]
-            > site_starts[valid_candidates]
+        overlaps[valid] = (
+            region_ends[candidate_indices[valid]]
+            > site_starts[valid]
         )
 
-        overlaps.loc[chromosome_sites.index] = chromosome_overlap
+        overlapping_indices = chromosome_sites.index[overlaps]
+        matching_region_indices = candidate_indices[overlaps]
 
-        print(
-            f"{chromosome}: "
-            f"{chromosome_overlap.sum():,} of "
-            f"{len(chromosome_overlap):,} sites overlap "
-            f"active regions"
+        sites.loc[overlapping_indices, "region_id"] = (
+            region_ids[matching_region_indices]
         )
 
-    return overlaps
+    sites["overlaps_active_region"] = sites["region_id"].notna()
+
+    return sites
 
 
 # ---------------------------------------------------------
-# Selection table
+# Deduplication
 # ---------------------------------------------------------
 
-def build_selection_table(
+def remove_duplicate_intervals(
     sites: pd.DataFrame,
-    pwms: dict,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Collapse records referring to the same genomic interval.
 
-    pwm_lengths = {
-        tf: information["length"]
-        for tf, information in pwms.items()
-    }
+    If an interval appears more than once, retain the record with
+    the highest supplied score. This also handles the uncommon case
+    where the same coordinates appear with conflicting strands.
+    """
 
-    sites["pwm_available"] = sites["tf"].isin(pwm_lengths)
-    sites["pwm_length"] = sites["tf"].map(pwm_lengths)
+    sites = sites.copy()
 
-    sites["length_matches_pwm"] = (
-        sites["site_length"] == sites["pwm_length"]
-    )
-
-    records = []
-
-    for tf, tf_sites in sites.groupby("tf", sort=True):
-        autosomal = tf_sites[
-            tf_sites["chromosome"].isin(PRIMARY_CHROMOSOMES)
-        ]
-
-        active = autosomal[
-            autosomal["overlaps_active_region"]
-        ]
-
-        length_matched_active = active[
-            active["length_matches_pwm"]
-        ]
-
-        records.append(
-            {
-                "tf": tf,
-                "pwm_available": tf in pwms,
-                "pwm_length": pwm_lengths.get(tf, np.nan),
-                "total_sites": len(tf_sites),
-                "autosomal_sites": len(autosomal),
-                "active_region_sites": len(active),
-                "length_matched_active_sites": len(
-                    length_matched_active
-                ),
-                "active_chromosomes": (
-                    length_matched_active["chromosome"].nunique()
-                ),
-                "positive_score_mean": (
-                    length_matched_active["score"].mean()
-                ),
-                "positive_score_median": (
-                    length_matched_active["score"].median()
-                ),
-                "positive_score_min": (
-                    length_matched_active["score"].min()
-                ),
-                "positive_score_max": (
-                    length_matched_active["score"].max()
-                ),
-            }
-        )
-
-    selection_table = pd.DataFrame(records)
-
-    selection_table["active_fraction"] = (
-        selection_table["active_region_sites"]
-        / selection_table["autosomal_sites"]
-    )
-
-    selection_table["length_match_fraction"] = (
-        selection_table["length_matched_active_sites"]
-        / selection_table["active_region_sites"]
-    )
-
-    selection_table = selection_table.sort_values(
-        [
-            "length_matched_active_sites",
-            "active_chromosomes",
+    exact_duplicate_count = sites.duplicated(
+        subset=[
+            "chromosome",
+            "start",
+            "end",
+            "strand",
         ],
-        ascending=[False, False],
+        keep=False,
+    ).sum()
+
+    coordinate_duplicate_count = sites.duplicated(
+        subset=[
+            "chromosome",
+            "start",
+            "end",
+        ],
+        keep=False,
+    ).sum()
+
+    sites = sites.sort_values(
+        "supplied_score",
+        ascending=False,
+    )
+
+    deduplicated = sites.drop_duplicates(
+        subset=[
+            "chromosome",
+            "start",
+            "end",
+        ],
+        keep="first",
+    ).copy()
+
+    deduplicated = deduplicated.sort_values(
+        ["chromosome", "start", "end"]
     ).reset_index(drop=True)
 
-    return selection_table
+    statistics = {
+        "exact_duplicate_records": exact_duplicate_count,
+        "coordinate_duplicate_records": coordinate_duplicate_count,
+        "records_after_deduplication": len(deduplicated),
+    }
+
+    return deduplicated, statistics
+
+
+# ---------------------------------------------------------
+# Sequence extraction
+# ---------------------------------------------------------
+
+def extract_sequences(
+    sites: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Extract core motifs and motif-plus-flank windows from hg19.
+
+    pysam uses zero-based, half-open coordinates, matching BED.
+    """
+
+    extracted_records = []
+
+    skipped_boundary = 0
+    skipped_length = 0
+    skipped_ambiguous = 0
+    skipped_invalid_strand = 0
+
+    with pysam.FastaFile(str(REFERENCE_PATH)) as genome:
+        chromosome_lengths = {
+            chromosome: genome.get_reference_length(chromosome)
+            for chromosome in PRIMARY_CHROMOSOMES
+        }
+
+        for site in sites.itertuples(index=False):
+            window_start = site.start - FLANK_LENGTH
+            window_end = site.end + FLANK_LENGTH
+
+            if (
+                window_start < 0
+                or window_end
+                > chromosome_lengths[site.chromosome]
+            ):
+                skipped_boundary += 1
+                continue
+
+            core_sequence = genome.fetch(
+                site.chromosome,
+                site.start,
+                site.end,
+            ).upper()
+
+            window_sequence = genome.fetch(
+                site.chromosome,
+                window_start,
+                window_end,
+            ).upper()
+
+            if (
+                len(core_sequence) != MOTIF_LENGTH
+                or len(window_sequence) != WINDOW_LENGTH
+            ):
+                skipped_length += 1
+                continue
+
+            if site.strand == "-":
+                core_sequence = reverse_complement(
+                    core_sequence
+                )
+                window_sequence = reverse_complement(
+                    window_sequence
+                )
+            elif site.strand != "+":
+                skipped_invalid_strand += 1
+                continue
+
+            if (
+                set(core_sequence) - {"A", "C", "G", "T"}
+                or set(window_sequence) - {"A", "C", "G", "T"}
+            ):
+                skipped_ambiguous += 1
+                continue
+
+            extracted_records.append(
+                {
+                    "site_id": (
+                        f"{site.chromosome}:"
+                        f"{site.start}-{site.end}:"
+                        f"{site.strand}"
+                    ),
+                    "chromosome": site.chromosome,
+                    "start": site.start,
+                    "end": site.end,
+                    "strand": site.strand,
+                    "tf": site.tf,
+                    "supplied_score": site.supplied_score,
+                    "region_id": site.region_id,
+                    "site_length": site.site_length,
+                    "window_start": window_start,
+                    "window_end": window_end,
+                    "core_sequence": core_sequence,
+                    "window_sequence": window_sequence,
+                    "gc_fraction": (
+                        window_sequence.count("G")
+                        + window_sequence.count("C")
+                    )
+                    / len(window_sequence),
+                    "label": 1,
+                }
+            )
+
+    extracted = pd.DataFrame(extracted_records)
+
+    statistics = {
+        "skipped_boundary": skipped_boundary,
+        "skipped_wrong_sequence_length": skipped_length,
+        "skipped_ambiguous_sequence": skipped_ambiguous,
+        "skipped_invalid_strand": skipped_invalid_strand,
+        "records_after_sequence_extraction": len(extracted),
+    }
+
+    return extracted, statistics
 
 
 # ---------------------------------------------------------
 # Validation
 # ---------------------------------------------------------
 
-def validate_overlap_examples(
-    sites: pd.DataFrame,
-    regions: pd.DataFrame,
-) -> None:
-    """
-    Manually validate a small sample of positive overlap calls.
-    """
+def validate_output(sites: pd.DataFrame) -> None:
+    """Perform consistency checks before saving."""
 
-    examples = sites[
-        sites["overlaps_active_region"]
-    ].sample(
-        n=min(10, sites["overlaps_active_region"].sum()),
-        random_state=561,
+    if sites.empty:
+        raise ValueError("No valid CTCF sites were produced.")
+
+    if not sites["site_length"].eq(MOTIF_LENGTH).all():
+        raise ValueError("Not all CTCF sites have length 15.")
+
+    if not sites["core_sequence"].str.len().eq(
+        MOTIF_LENGTH
+    ).all():
+        raise ValueError("Incorrect core-sequence length detected.")
+
+    if not sites["window_sequence"].str.len().eq(
+        WINDOW_LENGTH
+    ).all():
+        raise ValueError("Incorrect window-sequence length detected.")
+
+    if not sites["chromosome"].isin(
+        PRIMARY_CHROMOSOMES
+    ).all():
+        raise ValueError("Non-autosomal records are present.")
+
+    if not sites["strand"].isin(["+", "-"]).all():
+        raise ValueError("Unexpected strand values are present.")
+
+    valid_bases = {"A", "C", "G", "T"}
+
+    invalid_sequence_count = sum(
+        bool(set(sequence) - valid_bases)
+        for sequence in sites["window_sequence"]
     )
 
-    for site in examples.itertuples():
-        matching_regions = regions[
-            (regions["chromosome"] == site.chromosome)
-            & (regions["start"] < site.end)
-            & (regions["end"] > site.start)
-        ]
+    if invalid_sequence_count:
+        raise ValueError(
+            f"{invalid_sequence_count} sequences contain "
+            "non-ACGT characters."
+        )
 
-        if matching_regions.empty:
-            raise AssertionError(
-                "Overlap-validation failure for "
-                f"{site.chromosome}:{site.start}-{site.end}"
-            )
+    if sites["site_id"].duplicated().any():
+        raise ValueError("Duplicate site identifiers remain.")
 
-    print("Random overlap validation passed.")
+    if sites.duplicated(
+        subset=["chromosome", "start", "end"]
+    ).any():
+        raise ValueError(
+            "Duplicate genomic intervals remain."
+        )
 
 
 # ---------------------------------------------------------
-# Main
+# Main program
 # ---------------------------------------------------------
 
 def main() -> None:
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("Loading and validating PWMs...")
-    pwms = load_pwms(PWM_PATH)
+    summary_lines = []
 
-    print("\nLoading binding sites...")
-    sites = load_binding_sites()
-    print(f"Binding sites loaded: {len(sites):,}")
-
-    print("\nLoading active regulatory regions...")
-    regions = load_regulatory_regions()
-    print(f"Regulatory regions loaded: {len(regions):,}")
-
-    print("\nRestricting to chromosomes 1-22...")
-    sites = sites[
-        sites["chromosome"].isin(PRIMARY_CHROMOSOMES)
-    ].copy()
-
-    regions = regions[
-        regions["chromosome"].isin(PRIMARY_CHROMOSOMES)
-    ].copy()
-
-    print(f"Autosomal binding sites: {len(sites):,}")
-    print(f"Autosomal regulatory regions: {len(regions):,}")
-
-    print("\nCalculating overlaps...")
-    sites["overlaps_active_region"] = (
-        mark_regulatory_overlaps(sites, regions)
+    print("Loading binding sites...")
+    all_sites = load_binding_sites()
+    summary_lines.append(
+        f"All supplied binding-site records: {len(all_sites):,}"
     )
 
-    validate_overlap_examples(sites, regions)
+    print("Selecting CTCF autosomal sites...")
+    ctcf_sites = all_sites[
+        all_sites["tf"].eq(TF_NAME)
+        & all_sites["chromosome"].isin(
+            PRIMARY_CHROMOSOMES
+        )
+    ].copy()
 
-    print("\nBuilding TF-selection table...")
-    selection_table = build_selection_table(sites, pwms)
+    summary_lines.append(
+        f"Autosomal CTCF records: {len(ctcf_sites):,}"
+    )
 
-    selection_table.to_csv(
+    ctcf_sites = ctcf_sites[
+        ctcf_sites["site_length"].eq(MOTIF_LENGTH)
+    ].copy()
+
+    summary_lines.append(
+        "Autosomal CTCF records with expected motif length: "
+        f"{len(ctcf_sites):,}"
+    )
+
+    print("Loading active regulatory regions...")
+    regions = load_regulatory_regions()
+
+    regions = regions[
+        regions["chromosome"].isin(
+            PRIMARY_CHROMOSOMES
+        )
+    ].copy()
+
+    print("Annotating active-region overlaps...")
+    ctcf_sites = annotate_active_regions(
+        ctcf_sites,
+        regions,
+    )
+
+    ctcf_sites = ctcf_sites[
+        ctcf_sites["overlaps_active_region"]
+    ].copy()
+
+    summary_lines.append(
+        "CTCF records overlapping active regions: "
+        f"{len(ctcf_sites):,}"
+    )
+
+    print("Removing duplicate intervals...")
+    ctcf_sites, duplicate_statistics = (
+        remove_duplicate_intervals(ctcf_sites)
+    )
+
+    for key, value in duplicate_statistics.items():
+        summary_lines.append(f"{key}: {value:,}")
+
+    print("Extracting hg19 sequences...")
+    positive_sites, extraction_statistics = (
+        extract_sequences(ctcf_sites)
+    )
+
+    for key, value in extraction_statistics.items():
+        summary_lines.append(f"{key}: {value:,}")
+
+    print("Validating final dataset...")
+    validate_output(positive_sites)
+
+    chromosome_counts = (
+        positive_sites["chromosome"]
+        .value_counts()
+        .reindex(PRIMARY_CHROMOSOMES, fill_value=0)
+    )
+
+    strand_counts = positive_sites["strand"].value_counts()
+
+    summary_lines.append("")
+    summary_lines.append("Final chromosome counts:")
+
+    for chromosome, count in chromosome_counts.items():
+        summary_lines.append(
+            f"  {chromosome}: {count:,}"
+        )
+
+    summary_lines.append("")
+    summary_lines.append("Final strand counts:")
+
+    for strand, count in strand_counts.items():
+        summary_lines.append(f"  {strand}: {count:,}")
+
+    summary_lines.append("")
+    summary_lines.append(
+        "Supplied-score summary:"
+    )
+
+    summary_lines.append(
+        positive_sites["supplied_score"]
+        .describe()
+        .to_string()
+    )
+
+    summary_lines.append("")
+    summary_lines.append(
+        "Window GC-fraction summary:"
+    )
+
+    summary_lines.append(
+        positive_sites["gc_fraction"]
+        .describe()
+        .to_string()
+    )
+
+    positive_sites.to_csv(
         OUTPUT_PATH,
         sep="\t",
         index=False,
+        compression="gzip",
     )
 
-    print(f"\nSaved selection table to:\n{OUTPUT_PATH}")
+    SUMMARY_PATH.write_text(
+        "\n".join(summary_lines) + "\n"
+    )
 
-    display_columns = [
-        "tf",
-        "pwm_available",
-        "pwm_length",
-        "total_sites",
-        "active_region_sites",
-        "length_matched_active_sites",
-        "active_chromosomes",
-        "active_fraction",
-        "length_match_fraction",
-    ]
+    print("\n".join(summary_lines))
 
-    suitable = selection_table[
-        selection_table["pwm_available"]
-        & (
-            selection_table["length_matched_active_sites"]
-            >= 1000
-        )
-        & (
-            selection_table["active_chromosomes"]
-            >= 15
-        )
-    ]
+    print(f"\nSaved positive sites to:\n{OUTPUT_PATH}")
+    print(f"\nSaved summary to:\n{SUMMARY_PATH}")
 
-    print("\nTop 25 transcription factors:")
+    print("\nFirst five final records:")
     print(
-        selection_table[display_columns]
-        .head(25)
-        .to_string(
-            index=False,
-            float_format=lambda value: f"{value:.3f}",
-        )
+        positive_sites.head().to_string(index=False)
     )
-
-    print(
-        "\nTFs meeting preliminary suitability criteria "
-        "(at least 1,000 length-matched active sites and "
-        "at least 15 chromosomes):"
-    )
-
-    if suitable.empty:
-        print("None")
-    else:
-        print(
-            suitable[display_columns]
-            .to_string(
-                index=False,
-                float_format=lambda value: f"{value:.3f}",
-            )
-        )
 
 
 if __name__ == "__main__":
