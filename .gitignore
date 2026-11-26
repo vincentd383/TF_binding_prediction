@@ -1,3 +1,22 @@
-datasets/
+# Large biological datasets
+datasets/raw/*
+datasets/reference/*
+datasets/processed/*
 
-.venv
+# Keep directory structure
+!datasets/raw/.gitkeep
+!datasets/reference/.gitkeep
+!datasets/processed/.gitkeep
+
+# Generated outputs
+results/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# System files
+.DS_Store
