@@ -95,7 +95,7 @@ def audit_reference() -> set[str]:
         print("\nPrimary chromosome lengths:")
 
         for chromosome in PRIMARY_CHROMOSOMES:
-            print(f"  {chromosome}: {lengths,} bp")
+            print(f"  {chromosome}: {lengths[chromosome]:,} bp")
 
         test_sequence = genome.fetch("chr1", 16245, 16260)
 
